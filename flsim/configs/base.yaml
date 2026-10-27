@@ -1,0 +1,296 @@
+experiment:
+  name: "fl_experiment"
+  seed: 42
+  output_dir: "outputs/"
+
+data:
+  dataset: "mnist"          # mnist | cifar10 | cifar100 | ham10000
+  # Optional: force a specific architecture regardless of dataset default
+  # (mnist -> mnist_cnn, cifar10/cifar100/ham10000 -> cifar_cnn). Any
+  # flsim.models.factory registry key works for the 3-channel/32x32 datasets:
+  # "cifar_cnn" | "alexnet" | "vgg16" | "vgg19" | "resnet18" | "resnet34"
+  # (all CIFAR-10-adapted — see each model's module docstring). Leave null to
+  # use the dataset default.
+  model_name: null
+  # Optional: override the model's output class count (default: each
+  # dataset's natural count — mnist/cifar10=10, cifar100=100, ham10000=7).
+  # Leave null unless you have a reason to change it (e.g. a filtered subset
+  # of classes).
+  num_classes: null
+  # Required ONLY when dataset: "ham10000" — folder containing
+  # HAM10000_metadata.csv and the image subfolder(s). No auto-download is
+  # available for this dataset (see flsim.data.loaders.ham10000).
+  ham10000_root: null
+  # Optional input resize (pixels). null = each dataset's native size
+  # (mnist 28, cifar 32). Set to 64 to match papers that resize CIFAR/HAM to
+  # 64x64 — REQUIRED for the standard-stem ImageNet models (alexnet/vgg/resnet),
+  # whose downsampling stems need >= 64x64 (and whose FLOPs are quoted at 64x64).
+  image_size: null
+  num_clients: 50
+  partition: "iid"          # iid | shard | dirichlet
+  dirichlet_alpha: 0.5
+  num_shards: 200           # for shard partition
+  shards_per_client: 2      # for shard partition
+
+learning:
+  algorithm: "fedavg"
+  global_rounds: 100
+  clients_per_round: 10
+  local_epochs: 1
+  batch_size: 32
+  learning_rate: 0.01
+  # Local work per round — how much each client trains before its update counts.
+  #   local_iters: null  -> use local_epochs (E full passes over the local data;
+  #                         standard FedAvg — the framework's original behaviour).
+  #   local_iters: H (int > 0) -> do exactly H mini-batch SGD steps per round
+  #                         (H "local iterations", one mini-batch of `batch_size`
+  #                         each = H*batch_size sample-passes), OVERRIDING
+  #                         local_epochs. This is the local-work unit of
+  #                         semi-async split-FL papers (SAFSL's H); use it when a
+  #                         paper specifies iterations rather than epochs.
+  # Applies uniformly to EVERY paradigm (FL, FedAsync, SL, SFLV1/V2, SAFSL) —
+  # time, energy, traffic, AND training all use this same per-round work, so a
+  # cross-algorithm comparison stays fair (identical local work per round).
+  local_iters: null
+  # Optional alternate stopping condition, applies to BOTH the sync Simulator
+  # and the AsyncSimulator. Leave null (default) to stop after global_rounds
+  # rounds/epochs, as before.
+  # Set to a positive number of simulated seconds (e.g. 5000) to instead run
+  # until cumulative simulated_time_s reaches that budget — the run stops
+  # by elapsed simulated time regardless of how many rounds/epochs that took.
+  # global_rounds is ignored while this is active.
+  stop_by_time_s: null
+  # Split learning only (flsim.core.split_simulator.SplitSimulator via
+  # flsim.experiments.split_base.SplitExperiment) — the paper's "cut layer":
+  # the client keeps ordered_layers()[:cut_layer], the server keeps the rest.
+  # Model-dependent — see each Splittable model's docstring for its layer
+  # count and a sensible default (e.g. mnist_cnn has 10 layers; cut_layer=6
+  # is the natural features/classifier boundary). Must satisfy
+  # 1 <= cut_layer <= num_layers-1. Overridable per-run via
+  # run_single_split(cut_layer=...) without touching this file.
+  cut_layer: 6
+
+system:
+  # CPU frequency heterogeneity mode:
+  #   "fixed"        — all clients share cpu_frequency_hz
+  #   "discrete_ghz" — each client draws from {f_min, f_min+step, ..., f_max} GHz
+  #   "uniform_ghz"  — each client draws CONTINUOUSLY ~ U[f_min, f_max] GHz
+  #                    (use when a paper gives a continuous device-frequency
+  #                    range, e.g. SAFSL: f ~ U[0.1, 2] x 1e9 cycles/s)
+  cpu_freq_mode: "fixed"
+  cpu_frequency_hz: 2.0e+9       # used when cpu_freq_mode="fixed"
+  cpu_freq_min_ghz: 0.1          # lower bound (discrete_ghz / uniform_ghz)
+  cpu_freq_max_ghz: 0.8          # upper bound (discrete_ghz / uniform_ghz)
+  cpu_freq_step_ghz: 0.1         # step size (discrete_ghz only)
+  # How the per-sample compute workload C_k is set (drives compute time/energy):
+  #   "model_macs" (DEFAULT) — C_k is MEASURED from the actual model via
+  #        forward_macs (its MAC count, which equals a model's quoted "FLOPs").
+  #        Ties timing to whatever model/dataset you pick, automatically and
+  #        consistently across every algorithm — no manual FLOP-setting. The
+  #        cycles_per_sample_min/max below are then IGNORED.
+  #   "manual" — use cycles_per_sample_min/max below verbatim (a fixed workload
+  #        unrelated to the model; for reproducing a paper that states C directly,
+  #        or for a deliberately fixed cost).
+  cycles_per_sample_mode: "model_macs"
+  cycles_per_sample_min: 1.0e+6  # C_k lower bound (used only in "manual" mode)
+  cycles_per_sample_max: 1.0e+7  # C_k upper bound (used only in "manual" mode)
+  # NOTE: C_k is interpreted as FLOPs/sample when q (flops_per_cycle below, or
+  # the split cost model's q_device/q_server) is != 1. For a paper that fixes
+  # the model's per-sample FLOPs (e.g. a specific ResNet), set
+  # cycles_per_sample_min == max == that measured FLOP count.
+  #
+  # flops_per_cycle: hardware FLOPs executed per CPU cycle q_k (SIMD lanes ×
+  # cores, or GPU throughput). Compute time = C_k·D/(f·q); compute energy =
+  # κ·C_k·D·f²/q. This is the SYNC/ASYNC analog of split.q_device — it was
+  # previously MISSING from the sync/async path (implicit q=1), which forced
+  # "1 FLOP per cycle" (microcontroller) whenever C_k held FLOPs, inflating
+  # compute time/energy ~100–1000× vs real hardware. So when C_k = model FLOPs
+  # and f is a real clock (e.g. 0.1–2 GHz), set q to the device's FLOPs/cycle
+  # (mobile CPU/GPU ≈ 64–1024) so effective throughput f·q ≈ 0.1–1 TFLOPS.
+  # Default 1.0 = original behaviour (treat C_k as literal CPU cycles).
+  flops_per_cycle: 1.0
+  switched_capacitance: 1.0e-28  # kappa for energy model
+  # Which energy counts toward total_energy_j (UNIFIED across all paradigms):
+  #   "total"  (default) — device compute + edge-server compute + uplink TX +
+  #                        downlink TX (everything; paper eq. 16 literal).
+  #   "device"           — DEVICE/battery only: device compute + device uplink
+  #                        TX. Excludes the plugged-in server's compute and the
+  #                        BS's downlink TX. Use this for a battery-cost
+  #                        comparison where offloading to the server SAVES the
+  #                        device energy (otherwise a fast edge server's DVFS
+  #                        energy ~f² dominates and flips the result).
+  energy_scope: "total"
+
+wireless:
+  # Channel model:
+  #   "path_loss"  — 3GPP UMa (PL=128.1+37.6·log10(d_km)) + frozen log-normal shadowing
+  #   "exp_fading" — g = h0·ρ·d^{-α}, ρ~Exp(1)=|CN(0,1)|² re-drawn each round
+  #                  (complex-Gaussian small-scale fading; many FL / split-FL papers)
+  channel_model: "path_loss"
+  h0_path_loss_constant: 1.0e-6  # used when channel_model="exp_fading" (SNR calibration constant)
+  # Distance path-loss exponent α for the exp_fading model's g = h0·ρ·d^{-α}.
+  # Default 2.0 (free-space). Papers that state a path-fading exponent set this
+  # directly (e.g. SAFSL: 1.3). Only used when channel_model="exp_fading".
+  exp_fading_path_exponent: 2.0
+  # Deployment geometry (how each client's distance to the BS is set):
+  #   "square"         — (x,y) uniform in [-L/2, L/2]^2, area_side_m defines L
+  #   "circle"         — (x,y) uniform in disk of radius R, area_radius_m defines R
+  #   "distance_range" — distance itself ~ U[dist_min_m, dist_max_m] (use when a
+  #                      paper gives a device-to-BS distance range, e.g. SAFSL:
+  #                      d ~ U[100, 1000] m). Distances above are DERIVED from
+  #                      (x,y); this mode sets distance directly.
+  deployment_shape: "square"
+  area_side_m: 500.0             # used when deployment_shape="square"
+  area_radius_m: 500.0           # used when deployment_shape="circle"
+  dist_min_m: 100.0              # used when deployment_shape="distance_range"
+  dist_max_m: 1000.0             # used when deployment_shape="distance_range"
+  total_bandwidth_hz: 2.0e+7     # B = 20 MHz
+  tx_power_dbm: 10.0             # homogeneous device tx power (used unless a range below is set)
+  # Optional per-device UPLINK tx power range (watts): when BOTH are set, each
+  # device draws p_n ~ U[tx_power_w_min, tx_power_w_max] W instead of the single
+  # tx_power_dbm above (e.g. SAFSL: p_n ~ U[0.1, 0.2] W). Leave null to use tx_power_dbm.
+  tx_power_w_min: null
+  tx_power_w_max: null
+  noise_psd_dbm_per_hz: -174.0   # N0 thermal noise floor in dBm/Hz
+                                 # (paper N0 in W/Hz -> dBm/Hz = 10·log10(N0)+30;
+                                 #  e.g. N0=1e-18 W/Hz -> -150 dBm/Hz)
+  path_loss_intercept_db: 128.1  # used by path_loss model
+  path_loss_exponent: 37.6       # used by path_loss model
+  shadowing_std_db: 8.0          # used by path_loss model (0 = disable)
+  min_distance_m: 1.0            # clamp for all channel models (avoids g→∞)
+  # Minimum SNR floor (dB): the achievable rate is computed at max(SNR, floor),
+  # bounding worst-case transmission time. ESSENTIAL with channel_model:
+  # exp_fading, whose ρ~Exp(1) is unbounded-below — a deep fade (ρ≈0) otherwise
+  # gives a near-zero rate and a huge round-duration spike. null = no floor.
+  min_snr_db: null
+  upload_size_bits: 28100        # used when upload_size_mode="fixed"
+  upload_size_mode: "fixed"      # fixed | model
+  # Optional BS downlink transmit power P^DL (watts) — UNIFIED across ALL
+  # paradigms (sync, async, split, async-split). When set: downlink rate is
+  # computed at this BS power (instead of the device's uplink power), and
+  # downlink TX energy P^DL·t_down is charged (split-FL paper eq. 16 style).
+  # Leave null for the original symmetric-rate, uplink-only-energy convention.
+  # (e.g. SAFSL: 0.3 W)
+  downlink_tx_power_w: null
+  # Downlink (model broadcast) time:
+  #   false — download time is computed like upload (symmetric channel).
+  #   true  — download time = 0 (base station has unlimited power/bandwidth,
+  #           so the broadcast is instantaneous). Common assumption in FL papers.
+  # Applies to BOTH sync and async simulators. Round/arrival time then counts
+  # only compute + upload.
+  downlink_negligible: false
+
+evaluation:
+  evaluate_every: 1
+
+# Async FL settings (used only by AsyncSimulator / AsyncExperiment).
+# Ignored when running the synchronous Simulator.
+#
+# alpha:       base mixing hyperparameter α ∈ (0, 1).
+#              x_t = (1 - α_t)*x_{t-1} + α_t*x_new,  α_t = α * s(staleness).
+#              Smaller α → slower but more stable convergence.
+#
+# window_size: number of clients in flight at any time (concurrency level).
+#              Defaults to learning.clients_per_round if not set.
+#              Larger window → more staleness, faster simulated wall-clock time.
+#
+# The staleness function s(·) and client selection policy are set on the
+# algorithm object, not in the config:
+#   FedAsync(alpha=0.1)                              # constant s=1
+#   FedAsync(alpha=0.1, staleness_func="polynomial", a=0.5)
+#   FedAsync(alpha=0.1, staleness_func="hinge", a=10, b=4)
+#   FedAsyncTopKFast(alpha=0.1)                      # always pick K fastest
+async_fl:
+  alpha: 0.1
+  window_size: 10
+
+# Over-the-air (AirComp) aggregation settings — used only by FedOTA and other
+# algorithms built on flsim.system.ota.OTAChannel (Yang et al. 2019,
+# arXiv:1812.11750). Ignored by digital algorithms (FedAvg, FedProx, FedAsync).
+#
+# Like FedProx's mu, these are algorithm hyperparameters passed to the
+# constructor — sync algorithms don't read config directly. This section is the
+# canonical place to record/document your chosen values; mirror them into the
+# FedOTA(...) call in your experiment:
+#   FedOTA(p0_w=0.01, noise_power_w=1.03e-20, gamma_db=3.0)
+#
+# p0_w:          per-device peak transmit power P0 in watts (a natural choice
+#                is dbm_to_watts(wireless.tx_power_dbm) to reuse the same budget).
+# noise_power_w: receiver noise power sigma^2 per scalar channel use, in watts.
+#                Calibrate to your channel_gain() scale — see examples/ota_experiment.py.
+# gamma_db:      target aggregation-MSE budget in dB. Looser (higher) selects
+#                more devices but injects more aggregation noise. Paper uses 5 dB.
+#
+# The OTA uplink is simultaneous over the FULL wireless.total_bandwidth_hz (not
+# sliced per device), so upload time = model_size_scalars / total_bandwidth_hz,
+# constant regardless of how many devices participate. Transmission energy is
+# the squared norm of the transmitted signal (paper eq. 5), NOT p*t. FedOTA
+# writes both into the standard RoundResult/CSV via recompute_uplink_physics().
+ota:
+  p0_w:          0.01
+  noise_power_w: 1.03e-20
+  gamma_db:      3.0
+
+# Split learning (SL / SFLV1 / SFLV2) cost model — used only by SplitSimulator.
+# Latency/energy/traffic are computed on the SAME physical base as the sync/
+# async/OTA simulators (FDMA Shannon rate from `wireless`, DVFS energy with
+# `system.switched_capacitance` and each device's `cpu_frequency_hz`, uplink
+# TX energy = tx_power · time) — so all paradigms are directly comparable.
+# What differs is only split learning's workflow (device FP/BP + smashed-data
+# uplink + server FP/BP + gradient downlink + device-model up/down) and that
+# server-side compute runs at a separate, faster edge-server frequency below.
+# The device/server compute split at the cut layer is measured automatically
+# (flsim.system.flops), so nothing model-specific needs to be entered here.
+split:
+  server_cpu_frequency_hz: 3.0e+9   # f_S — edge-server frequency (cycles/s).
+                                    # The centralized "Normal" baseline also
+                                    # runs on this (one powerful machine).
+  # FLOPs-per-cycle (hardware throughput). Compute time = FLOPs / (freq · q);
+  # compute energy = κ · FLOPs · f² / q. These are HARDWARE params (device vs
+  # server), NOT per-algorithm — the device value applies identically to every
+  # method's device-side compute (FL, FedAsync, SL, SFL, SAFSL), so comparisons
+  # stay fair. Defaults 1.0 = the framework's original behaviour (time=cycles/freq),
+  # so leaving them at 1.0 changes nothing. Papers that state throughputs set them
+  # (e.g. SAFSL: device q_n=1, edge-server q_S=2 -> server does 2 FLOPs/cycle).
+  # They only affect COMPUTE (time+energy); communication/traffic are untouched.
+  q_device: 1.0
+  q_server: 1.0
+  # DEPRECATED alias for wireless.downlink_tx_power_w (still honoured by the
+  # split cost model if the wireless one is null) — prefer the wireless key,
+  # which applies the SAME downlink physics to every paradigm.
+  downlink_tx_power_w: null
+  # Server-capacity sharing (paper: sum_n f^S_n <= f^S,max). true (default):
+  # when several devices' server-side jobs run CONCURRENTLY (SFLV1; async
+  # split's whole in-flight window), each is allocated an equal share
+  # f_S / n_concurrent — the BS's stated capacity is a TOTAL, not per-device.
+  # Sequential-server modes (SL, SFLV2) always use the full f_S per job (one
+  # stream at a time). false restores the old every-device-at-full-f_S
+  # behaviour (models a BS with n_concurrent x f_S capacity — usually wrong).
+  server_frequency_shared: true
+
+# Plots generated after each run (and in comparison experiments).
+# Each entry produces one PNG. Remove entries you don't want.
+# Available metrics (CSV columns):
+#   test_accuracy, test_loss, mean_compute_time_s, max_compute_time_s,
+#   mean_upload_time_s, max_upload_time_s, mean_compute_energy_j,
+#   total_energy_j, mean_channel_gain, mean_rate_bps, round_duration_s
+# x: round | simulated_time_s
+plots:
+  - metric: test_accuracy
+    x: round
+    ylabel: "Test Accuracy"
+  - metric: test_accuracy
+    x: simulated_time_s
+    ylabel: "Test Accuracy"
+  - metric: test_loss
+    x: round
+    ylabel: "Test Loss"
+  - metric: total_energy_j
+    x: round
+    ylabel: "Energy per client per round (J)"
+  - metric: mean_rate_bps
+    x: round
+    ylabel: "Mean Rate (bps)"
+  - metric: round_duration_s
+    x: round
+    ylabel: "Round Duration (s)"
